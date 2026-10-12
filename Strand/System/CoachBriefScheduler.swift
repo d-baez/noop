@@ -43,6 +43,17 @@ enum CoachBriefScheduler {
 
     /// 07:00 — a brief waiting when you check your phone (matches `ScheduledDebugExport`'s default).
     static let defaultTimeMinutes = 7 * 60
+
+    /// Sleep-gated brief (macOS): when set, the brief waits until this says today's Charge is scored, so it
+    /// is built on last night's sleep rather than on whatever had synced by the clock time. `AppModel`
+    /// wires it to the Today row; nil (iOS) keeps the plain at-the-time behaviour.
+    static var isTodayScored: (() -> Bool)?
+    /// Companion gate: false while the daily history hasn't loaded yet, so a launch can't take the
+    /// fallback below on an empty dashboard and brief from nothing.
+    static var historyLoaded: (() -> Bool)?
+    /// How long past the chosen time to keep waiting for an unscored night before briefing anyway (the
+    /// TODAY block then says today's Charge isn't in yet). A night off the wrist still gets a brief.
+    static let unscoredFallbackMinutes = 3 * 60
     private static let minutesPerDay = 24 * 60
 
     /// Category id the posted notification carries, so `NotificationPresenter` can recognise a brief tap
@@ -154,7 +165,23 @@ enum CoachBriefScheduler {
 
     /// The result of enabling the schedule — mirrors `WindDownNudge.EnableOutcome` so the UI can revert
     /// the toggle and point at Settings on denial instead of persisting a dead "on" state.
-    enum EnableOutcome { case scheduled, denied, off }
+    /// `scheduledWithoutNotifications` (macOS): notifications are off for NOOP, but the brief is still
+    /// armed and waits in Coach, since the Mac app is usually open and the Coach screen is where it is read.
+    enum EnableOutcome { case scheduled, scheduledWithoutNotifications, denied, off }
+
+    /// Notifications refused. iOS keeps the old revert (a brief nobody is told about is useless there);
+    /// macOS arms anyway so the brief still lands in Coach, and says why there will be no banner.
+    private static func enableWithoutNotifications(generateBrief: @escaping () async -> String?,
+                                                   completion: (@MainActor (EnableOutcome) -> Void)?) {
+        #if os(macOS)
+        UserDefaults.standard.set(true, forKey: K.enabled)
+        scheduleNext(generateBrief: generateBrief)
+        completion?(.scheduledWithoutNotifications)
+        #else
+        UserDefaults.standard.set(false, forKey: K.enabled)
+        completion?(.denied)
+        #endif
+    }
 
     /// Enable/disable and (re)schedule. Enabling gates on notification authorization first (asks once if
     /// undetermined; reports `.denied` rather than silently scheduling something the OS will never
@@ -186,14 +213,12 @@ enum CoachBriefScheduler {
                                 scheduleNext(generateBrief: generateBrief)
                                 completion?(.scheduled)
                             } else {
-                                UserDefaults.standard.set(false, forKey: K.enabled)
-                                completion?(.denied)
+                                enableWithoutNotifications(generateBrief: generateBrief, completion: completion)
                             }
                         }
                     }
                 default:
-                    UserDefaults.standard.set(false, forKey: K.enabled)
-                    completion?(.denied)
+                    enableWithoutNotifications(generateBrief: generateBrief, completion: completion)
                 }
             }
         }
@@ -211,6 +236,14 @@ enum CoachBriefScheduler {
     static func activateIfEnabled(generateBrief: @escaping () async -> String?) {
         guard isEnabled else { return }
         scheduleNext(generateBrief: generateBrief)
+        Task { await catchUpIfDue(generateBrief: generateBrief) }
+    }
+
+    /// The daily history changed (a sync banked or re-scored a night): if the brief is waiting on today's
+    /// Charge, this is the moment it may have landed. Cheap when nothing is due; the day guard and the
+    /// in-flight claim in `catchUpIfDue` keep it to one brief a day.
+    static func sleepDataChanged(generateBrief: @escaping () async -> String?) {
+        guard isEnabled else { return }
         Task { await catchUpIfDue(generateBrief: generateBrief) }
     }
 
@@ -267,6 +300,10 @@ enum CoachBriefScheduler {
         let nowMinutes = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
         guard nowMinutes >= timeMinutes else { return true }                                  // not yet time today
         guard UserDefaults.standard.string(forKey: K.lastRun) != dayKey(now) else { return true } // already ran today
+        if let loaded = historyLoaded, !loaded() { return true }                              // history not loaded yet
+        // Wait for last night's sleep to be scored; past the fallback window, brief anyway.
+        if let scored = isTodayScored, !scored(),
+           nowMinutes < timeMinutes + unscoredFallbackMinutes { return true }
 
         // One attempt at a time; see `generationInFlight` for why the day guard alone is not enough.
         guard await claimGeneration() else { return true }
@@ -352,7 +389,10 @@ enum CoachBriefScheduler {
         #if os(macOS)
         macTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        let delay = secondsToNextOccurrence(timeMinutes)
+        // Wake at the chosen time, and again at the unscored-night fallback mark if that comes first.
+        // Between the two, `sleepDataChanged` fires the brief as soon as the night is scored.
+        let fallback = min(timeMinutes + unscoredFallbackMinutes, minutesPerDay - 1)
+        let delay = min(secondsToNextOccurrence(timeMinutes), secondsToNextOccurrence(fallback))
         timer.schedule(deadline: .now() + delay)
         timer.setEventHandler {
             Task { @MainActor in

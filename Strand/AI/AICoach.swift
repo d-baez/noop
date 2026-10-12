@@ -788,7 +788,7 @@ final class AICoachEngine: ObservableObject {
         // K13: if the conversation overflows the sliding window, summarize the dropped middle so
         // the model retains context continuity. Best-effort; failure degrades to the old gap.
         await summarizeDroppedMiddleIfNeeded(key: key)
-        var wire = wireMessages(context: context)
+        var wire = wireMessages(context: context, anchor: dataConsent ? todayAnchor(.chat(question: trimmed)) : nil)
 
         // K11: If a chart image is pending and the provider is Gemini, attach it to the last
         // user turn as inline_data. Non-Gemini providers can't accept images, so the image is
@@ -865,7 +865,7 @@ final class AICoachEngine: ObservableObject {
 
         let context = await buildFullContext()
         let wire: [(role: ChatMessage.Role, content: String)] =
-            [(.user, context + "\n\n---\n\n" + Self.briefInstruction)]
+            [(.user, context + "\n\n---\n\n" + todayAnchor(.brief) + "\n\n" + Self.briefInstruction())]
 
         let prefix = "Today's brief\n\n"
         let placeholder = ChatMessage(role: .assistant, text: prefix)
@@ -925,12 +925,24 @@ final class AICoachEngine: ObservableObject {
     /// K5: The brief instruction shared by the interactive `startBriefIfNeeded()` (streamed into the
     /// chat) and the headless `generateBrief()` below (used by the scheduled morning-brief notification).
     /// Kept in one place so the two paths never drift.
-    private static let briefInstruction = """
-    Based on the data above, give me TODAY'S coaching brief in three short parts: \
-    (1) my readiness in one line, citing charge, HRV and rest; \
-    (2) exactly what training to do today and what to avoid; \
-    (3) one specific thing to improve my charge. Be punchy and motivating.
-    """
+    /// Time-aware: from 18:00 part (2) asks for tonight's recovery and tomorrow's provisional plan. A
+    /// brief generated at 10:14 PM said "hit the gym after work for a solid hour": the evening note in
+    /// the TODAY block lost to this instruction's "what training to do today".
+    static func briefInstruction(now: Date = Date(), calendar: Calendar = .current) -> String {
+        let part2 = isEvening(now, calendar: calendar)
+            ? "(2) it's evening, so today's training window has passed: what to do tonight to recover, and a "
+                + "provisional training plan for tomorrow (tomorrow's charge isn't known yet; today's zone is the best guide); "
+            : "(2) exactly what training to do today and what to avoid; "
+        return "Based on the TODAY block above, give me TODAY'S coaching brief in three short parts: "
+            + "(1) my readiness in one line, citing today's charge, zone, HRV and rest exactly as given; "
+            + part2
+            + "(3) one specific thing to improve my charge. Be punchy and motivating."
+    }
+
+    /// 18:00 onwards: the brief and TODAY block switch from "train today" to "tonight + tomorrow".
+    static func isEvening(_ now: Date, calendar: Calendar = .current) -> Bool {
+        calendar.component(.hour, from: now) >= 18
+    }
 
     /// K5: Generate today's coaching brief WITHOUT touching the visible chat transcript. Used by the
     /// scheduled morning-brief notification (`CoachBriefScheduler`), which can run with no Coach screen
@@ -945,7 +957,7 @@ final class AICoachEngine: ObservableObject {
         guard isConfigured, dataConsent, let key = resolvedKey else { return nil }
         let context = await buildFullContext()
         let wire: [(role: ChatMessage.Role, content: String)] =
-            [(.user, context + "\n\n---\n\n" + Self.briefInstruction)]
+            [(.user, context + "\n\n---\n\n" + todayAnchor(.brief) + "\n\n" + Self.briefInstruction())]
         guard let reply = try? await callProvider(key: key, messages: wire) else { return nil }
         let clean = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         return clean.isEmpty ? nil : clean
@@ -1169,20 +1181,177 @@ final class AICoachEngine: ObservableObject {
         }
     }
 
-    /// The chat as `(role, content)` pairs, with the metrics context prepended to the first user turn.
-    private func wireMessages(context: String) -> [(role: ChatMessage.Role, content: String)] {
+    /// The chat as `(role, content)` pairs, with the metrics context prepended to the first user turn
+    /// and the TODAY anchor (when given) prepended to the LATEST user turn, so the model reads today's
+    /// computed numbers right beside the question instead of fishing them out of the 14-day list.
+    private func wireMessages(context: String, anchor: String?) -> [(role: ChatMessage.Role, content: String)] {
         var out: [(role: ChatMessage.Role, content: String)] = []
-        var contextInjected = false
-        for m in windowedMessages() {
-            if m.role == .user && !contextInjected {
-                contextInjected = true
-                out.append((.user, context + "\n\n---\n\nQuestion: " + m.text))
-            } else {
-                out.append((m.role, m.text))
-            }
+        let window = windowedMessages()
+        let firstUser = window.firstIndex(where: { $0.role == .user })
+        let lastUser = window.lastIndex(where: { $0.role == .user })
+        for (i, m) in window.enumerated() {
+            guard m.role == .user else { out.append((m.role, m.text)); continue }
+            var prefix = ""
+            if i == firstUser { prefix += context + "\n\n---\n\n" }
+            if i == lastUser, let anchor { prefix += anchor + "\n\n" }
+            out.append((.user, prefix.isEmpty ? m.text : prefix + "Question: " + m.text))
         }
         return out
     }
+
+    // MARK: - Today anchor
+
+    /// Who the TODAY block is for. The brief asks for a plan, so it gets the zone prescription and the
+    /// week ahead. A chat question gets today's numbers with an answer-what-was-asked rule: repeating
+    /// "prescribe for the zone" + a 7-day list beside every question made a 7B bolt a full plan and a
+    /// week-ahead onto "how bad did Thursday and Friday hurt me?".
+    enum AnchorMode: Equatable {
+        case brief
+        case chat(question: String)
+    }
+
+    /// TODAY block for the live clock: today's row as the Today screen resolves it, plus the freshest
+    /// scored day for when today isn't scored yet (same anchor the widgets use, #911).
+    func todayAnchor(_ mode: AnchorMode = .brief) -> String {
+        let days = repo.days
+        return Self.todayAnchor(today: repo.today,
+                                latestScored: Repository.widgetAnchor(days: days),
+                                last30: Array(days.suffix(30)),
+                                mode: mode)
+    }
+
+    /// Whether a chat question is about the days ahead, so the weekday-labelled week list is worth
+    /// sending. Plain keyword match: cheap, and a miss only means the list is left out. Weekday names are
+    /// deliberately not triggers: "I went out Thursday" is about the past, which the history already labels.
+    static func asksAboutDaysAhead(_ question: String) -> Bool {
+        let q = question.lowercased()
+        let words = ["week", "plan", "schedule", "tomorrow", "weekend", "next few days", "coming days"]
+        return words.contains { q.contains($0) }
+    }
+
+    /// Pure builder for the TODAY block. Small local models (a 7B over Ollama) were quoting the 30-day
+    /// averages as today's numbers and prescribing for the wrong zone, so the zone is computed here
+    /// (same 34/67 bands as `RecoveryScorer.band` and the default prompt) and stated outright, with
+    /// today's vitals set against their 30-day averages and the reply rules repeated beside the question.
+    static func todayAnchor(today: DailyMetric?, latestScored: DailyMetric?, last30: [DailyMetric],
+                            mode: AnchorMode = .brief, now: Date = Date(),
+                            calendar: Calendar = .current) -> String {
+        func avg(_ xs: [Double]) -> Double? { xs.isEmpty ? nil : xs.reduce(0, +) / Double(xs.count) }
+        let avgHrv = avg(last30.compactMap { $0.avgHrv })
+        let avgRhr = avg(last30.compactMap { $0.restingHr.map(Double.init) })
+        let avgSleep = avg(last30.compactMap { $0.totalSleepMin })
+
+        let includeWeek: Bool
+        let answerRule: String?
+        switch mode {
+        case .brief:
+            includeWeek = true
+            answerRule = nil
+        case .chat(let question):
+            includeWeek = asksAboutDaysAhead(question)
+            answerRule = "Answer the question the user actually asked, directly. Give a training prescription "
+                + "or week plan ONLY if they ask for one."
+        }
+
+        guard let today, let charge = today.recovery else {
+            var lines = ["TODAY" + (today.map { " (\(dated($0.day)))" } ?? "") + ": charge is NOT scored yet (no night banked)."]
+            lines.append(clockLine(now, calendar: calendar))
+            if let s = latestScored, let c = s.recovery {
+                lines.append("  Latest scored day \(dated(s.day)): charge \(Int(c.rounded())) → \(zoneLabel(c)).")
+            }
+            if includeWeek, let week = today.flatMap({ weekAhead(after: $0.day) }) { lines.append(week) }
+            lines.append("Rules: say plainly that today's charge isn't in yet; do NOT present the latest scored "
+                         + "day or the 30-day averages as today's numbers." + (answerRule.map { " " + $0 } ?? ""))
+            return lines.joined(separator: "\n")
+        }
+
+        var vitals: [String] = []
+        if let h = today.avgHrv {
+            vitals.append("HRV \(Int(h.rounded()))ms" + (avgHrv.map { " (30-day avg \(Int($0.rounded())))" } ?? ""))
+        }
+        if let r = today.restingHr {
+            vitals.append("RHR \(r)bpm" + (avgRhr.map { " (30-day avg \(Int($0.rounded())))" } ?? ""))
+        }
+        if let m = today.totalSleepMin {
+            vitals.append(String(format: "last night's sleep %.1fh", m / 60) + (avgSleep.map { String(format: " (30-day avg %.1fh)", $0 / 60) } ?? ""))
+        }
+        if let e = today.strain { vitals.append(String(format: "effort so far today %.1f (already done, not a target)", e)) }
+        if let t = today.skinTempDevC { vitals.append(String(format: "skin-temp deviation %+.2f°C", t)) }
+
+        var lines = ["TODAY (\(dated(today.day))) — use THESE numbers for today; the 30-day averages are background only:"]
+        lines.append(clockLine(now, calendar: calendar))
+        lines.append("  charge \(Int(charge.rounded())) → \(zoneLabel(charge))")
+        if !vitals.isEmpty { lines.append("  " + vitals.joined(separator: ", ")) }
+        if includeWeek, let week = weekAhead(after: today.day) { lines.append(week) }
+        if let answerRule {
+            lines.append("Rules: cite these exact numbers as today's; never quote the 30-day averages as today's "
+                         + "numbers. " + answerRule + " Any advice you do give must fit the "
+                         + RecoveryScorer.band(charge).uppercased() + " zone.")
+        } else {
+            let band = RecoveryScorer.band(charge).uppercased()
+            lines.append("Rules: cite these exact numbers as today's; "
+                         + (isEvening(now, calendar: calendar)
+                            ? "it's evening, so do NOT prescribe a workout for today: give tonight's recovery steps and "
+                              + "tomorrow's provisional plan, guided by the \(band) zone; "
+                            : "prescribe for the \(band) zone; ")
+                         + "never quote the 30-day averages as today's numbers.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// "Local time now: Sunday 9:48 PM". The model was never told the time, so a brief generated at
+    /// 9:48 PM said to push hard in training "today". From 18:00 it also says the day is mostly done.
+    static func clockLine(_ now: Date, calendar: Calendar = .current) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = calendar
+        f.timeZone = calendar.timeZone
+        f.dateFormat = "EEEE h:mm a"
+        let late = isEvening(now, calendar: calendar)
+        return "  Local time now: " + f.string(from: now)
+            + (late ? " (evening: today's training window has mostly passed; focus on tonight and tomorrow)" : "")
+    }
+
+    private static func zoneLabel(_ charge: Double) -> String {
+        switch RecoveryScorer.band(charge) {
+        case "green": return "GREEN zone (67-100): green light to build/push"
+        case "yellow": return "YELLOW zone (34-66): maintain, quality over volume"
+        default: return "RED zone (0-33): active recovery only (Zone 2, mobility, extra sleep)"
+        }
+    }
+
+    /// "Saturday 2026-10-10" for a stored "yyyy-MM-dd" day key (the raw key if it doesn't parse). A small
+    /// model can't derive weekdays from dates (a 7B labelled Saturday 2026-10-10 "Monday" in a week-ahead
+    /// plan), so every date the coach sees carries its weekday. English names: the prompts are English.
+    static func dated(_ day: String) -> String {
+        guard let date = dayKeyParser.date(from: day) else { return day }
+        return weekdayFormatter.string(from: date) + " " + day
+    }
+
+    /// The seven days after `day`, weekday-labelled, so a week-ahead plan uses real weekdays.
+    static func weekAhead(after day: String) -> String? {
+        guard let start = dayKeyParser.date(from: day) else { return nil }
+        let next = (1...7).compactMap { utcCalendar.date(byAdding: .day, value: $0, to: start) }
+            .map { dated(dayKeyParser.string(from: $0)) }
+        return "  Next 7 days (use these exact weekday names for any week-ahead plan): " + next.joined(separator: ", ")
+    }
+
+    // Day keys are calendar dates, not instants: parse and format in UTC so no zone shifts the weekday.
+    private static let utcCalendar: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "UTC")!
+        return c
+    }()
+    private static func utcFormatter(_ format: String) -> DateFormatter {
+        let f = DateFormatter()
+        f.calendar = utcCalendar
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = utcCalendar.timeZone
+        f.dateFormat = format
+        return f
+    }
+    private static let dayKeyParser = utcFormatter("yyyy-MM-dd")
+    private static let weekdayFormatter = utcFormatter("EEEE")
 
     // MARK: - Context builder
 
@@ -1213,7 +1382,7 @@ final class AICoachEngine: ObservableObject {
         // 30-day averages.
         let last30 = Array(days.suffix(30))
         lines.append("")
-        lines.append("30-day averages:")
+        lines.append("30-day averages (background only, NOT today's numbers):")
         lines.append("  charge: \(avgInt(last30.compactMap { $0.recovery }))"
                      + ", effort: \(avgOne(last30.compactMap { $0.strain }))"
                      + ", sleep: \(avgSleepHours(last30))h"
@@ -1262,7 +1431,7 @@ final class AICoachEngine: ObservableObject {
     /// handed the day list — so without this the formatter has no seam and the Swift half of a change
     /// with fifteen Kotlin tests would ship untested.
     func dayLine(_ d: DailyMetric) -> String {
-        var parts: [String] = [d.day + ":"]
+        var parts: [String] = [Self.dated(d.day) + ":"]
         parts.append("charge " + (d.recovery.map { "\(Int($0.rounded()))" } ?? "—"))
         parts.append("effort " + (d.strain.map { String(format: "%.1f", $0) } ?? "—"))
         parts.append("rest " + (d.totalSleepMin.map { String(format: "%.1fh", $0 / 60) } ?? "—"))

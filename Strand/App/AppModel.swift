@@ -363,6 +363,20 @@ final class AppModel: ObservableObject {
             // Keep the battery night-guard's learned bedtime warm off the same signal (throttled inside).
             self?.refreshHabitualMidsleep()
         }.store(in: &hrCancellables)
+        // Morning brief built on last night's sleep: armed at launch (not only when Coach opens), and
+        // re-checked whenever the daily history settles, so it lands once today's Charge is scored.
+        // `today.day == localDayKey` keeps a pre-04:00 logical day from passing yesterday off as today.
+        CoachBriefScheduler.isTodayScored = { [weak self] in
+            guard let today = self?.repo.today else { return false }
+            return today.recovery != nil && today.day == Repository.localDayKey(Date())
+        }
+        CoachBriefScheduler.historyLoaded = { [weak self] in !(self?.repo.days.isEmpty ?? true) }
+        let briefCoach = coach
+        CoachBriefScheduler.activateIfEnabled { await briefCoach.generateBrief() }
+        // Debounced: `$days` publishes in willSet and re-scores land in bursts.
+        repo.$days.dropFirst().debounce(for: .seconds(5), scheduler: RunLoop.main).sink { _ in
+            CoachBriefScheduler.sleepDataChanged { await briefCoach.generateBrief() }
+        }.store(in: &hrCancellables)
         // Re-arm the strap's firmware alarm once the connection has SETTLED — not the instant it (re)bonds.
         // A smart-alarm time changed while the strap was away never reached it , the send is gated on bond
         // , so the strap kept the OLD time and fired at it (#59).

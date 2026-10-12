@@ -1,5 +1,8 @@
 import SwiftUI
 import StrandDesign
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Coach settings, split out of `CoachView` so the coach screen is the conversation and nothing else
 /// (#2243). Holds the surfaces that used to stack above the transcript: the data-sharing consent, the
@@ -23,6 +26,15 @@ struct CoachSettingsView: View {
     @State private var briefMinutes: Int = CoachBriefScheduler.timeMinutes
     @State private var briefGenerating = false
     @State private var briefStatus: String?
+    /// True when the brief is on but macOS notifications are off for NOOP: shows the Settings shortcut.
+    @State private var briefNeedsNotifications = false
+    /// `Platform.deviceNounPhrase` is "this Mac", so comparing it to "Mac" was never true and the Mac
+    /// copy never showed. Compile-time instead.
+    #if os(macOS)
+    private static let isMac = true
+    #else
+    private static let isMac = false
+    #endif
 
     /// The coach-instructions editor, collapsed until asked for.
     @State private var promptExpanded: Bool = false
@@ -277,9 +289,16 @@ struct CoachSettingsView: View {
                 }
                 .onChangeCompat(of: briefEnabled) { on in
                     CoachBriefScheduler.setEnabled(on, generateBrief: { await coach.generateBrief() }) { outcome in
-                        if outcome == .denied {
+                        briefNeedsNotifications = false
+                        switch outcome {
+                        case .denied:
                             briefEnabled = false
                             briefStatus = "Notifications are off for NOOP — enable them in Settings first."
+                        case .scheduledWithoutNotifications:
+                            briefNeedsNotifications = true
+                            briefStatus = "Notifications are off for NOOP, so the brief will wait for you here in Coach instead of popping up. Allow NOOP in Notification settings to get a banner too."
+                        case .scheduled, .off:
+                            briefStatus = nil
                         }
                     }
                 }
@@ -287,23 +306,37 @@ struct CoachSettingsView: View {
                 if briefEnabled {
                     Divider().overlay(StrandPalette.hairline)
                     HStack {
-                        Text("Time").font(StrandFont.subhead).foregroundStyle(StrandPalette.textPrimary)
+                        Text(Self.isMac ? "Not before" : "Time").font(StrandFont.subhead).foregroundStyle(StrandPalette.textPrimary)
                         Spacer()
                         DatePicker("", selection: briefTimeBinding, displayedComponents: .hourAndMinute)
                             .labelsHidden()
                             .accessibilityLabel("Morning brief time")
                     }
-                    Text("At \(Platform.deviceNounPhrase == "Mac" ? "this time" : "or soon after"), NOOP will use your key to generate today's brief. Best-effort: \(Platform.deviceNounPhrase) decides exactly when a backgrounded app wakes.")
+                    Text(Self.isMac
+                         ? "NOOP waits for last night's sleep to sync and score, then uses your key to generate today's brief, no earlier than this time. If today's Charge still isn't in 3 hours later, the brief comes anyway and says so."
+                         : "At or soon after this time, NOOP will use your key to generate today's brief. Best-effort: \(Platform.deviceNounPhrase) decides exactly when a backgrounded app wakes.")
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
                     NoopButton(briefGenerating ? "Generating…" : "Generate now", systemImage: "sparkles", kind: .secondary) {
                         generateBriefNow()
                     }
                     .disabled(briefGenerating)
-                    if let briefStatus {
-                        Text(briefStatus).font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                }
+                // Outside `if briefEnabled`: a refused enable flips the toggle back off, and inside that block
+                // its explanation vanished with it, so the switch just snapped back with no reason given.
+                if let briefStatus {
+                    Text(briefStatus).font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                #if canImport(AppKit)
+                if briefNeedsNotifications {
+                    NoopButton("Open Notification settings", systemImage: "bell.badge", kind: .secondary) {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+                            NSWorkspace.shared.open(url)
+                        }
                     }
                 }
+                #endif
             }
         }
     }
